@@ -7,6 +7,7 @@ import (
 	"coze-discord-proxy/model"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/gin-gonic/gin"
@@ -29,12 +30,15 @@ var BotToken = os.Getenv("BOT_TOKEN")
 var CozeBotId = os.Getenv("COZE_BOT_ID")
 var GuildId = os.Getenv("GUILD_ID")
 var ChannelId = os.Getenv("CHANNEL_ID")
+var DefaultChannelEnable = os.Getenv("DEFAULT_CHANNEL_ENABLE")
 var ProxyUrl = os.Getenv("PROXY_URL")
 var ChannelAutoDelTime = os.Getenv("CHANNEL_AUTO_DEL_TIME")
 var CozeBotStayActiveEnable = os.Getenv("COZE_BOT_STAY_ACTIVE_ENABLE")
 var UserAgent = os.Getenv("USER_AGENT")
 var UserAuthorization = os.Getenv("USER_AUTHORIZATION")
-var UserId = os.Getenv("USER_ID")
+var UserAuthorizations = strings.Split(UserAuthorization, ",")
+
+//var UserId = os.Getenv("USER_ID")
 
 var BotConfigList []model.BotConfig
 
@@ -99,9 +103,6 @@ func checkEnvVariable() {
 	if UserAuthorization == "" {
 		common.FatalLog("环境变量 USER_AUTHORIZATION 未设置")
 	}
-	if UserId == "" {
-		common.FatalLog("环境变量 USER_ID 未设置")
-	}
 	if BotToken == "" {
 		common.FatalLog("环境变量 BOT_TOKEN 未设置")
 	}
@@ -157,6 +158,15 @@ func loadBotConfig() {
 		common.FatalLog("Error parsing JSON:", err)
 	}
 
+	// 校验默认频道
+	if DefaultChannelEnable == "1" {
+		for _, botConfig := range BotConfigList {
+			if botConfig.ChannelId == "" {
+				common.FatalLog("默认频道开关开启时,必须为每个Coze-Bot配置ChannelId")
+			}
+		}
+	}
+
 	common.LogInfo(context.Background(), fmt.Sprintf("载入配置文件成功 BotConfigs: %+v", BotConfigList))
 }
 
@@ -170,9 +180,12 @@ func messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdate) {
 	// 尝试获取 stopChan
 	stopChan, exists := ReplyStopChans[m.ReferencedMessage.ID]
 	if !exists {
+		channel, err := Session.Channel(m.ChannelID)
 		// 不存在则直接删除频道
-		SetChannelDeleteTimer(m.ChannelID, 5*time.Minute)
-		return
+		if err != nil || strings.HasPrefix(channel.Name, "cdp-对话") {
+			SetChannelDeleteTimer(m.ChannelID, 5*time.Minute)
+			return
+		}
 	}
 
 	// 如果作者为 nil 或消息来自 bot 本身,则发送停止信号
@@ -184,9 +197,6 @@ func messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdate) {
 		return
 	}
 
-	// 检查消息是否是对 bot 的回复
-	//for _, mention := range m.Mentions {
-	//if mention.ID == UserId {
 	replyChan, exists := RepliesChans[m.ReferencedMessage.ID]
 	if exists {
 		reply := processMessage(m)
@@ -237,8 +247,6 @@ func messageUpdate(s *discordgo.Session, m *discordgo.MessageUpdate) {
 	}
 
 	return
-	//}
-	//}
 }
 
 // processMessage 提取并处理消息内容及其嵌入元素
@@ -340,26 +348,44 @@ func SendMessage(c *gin.Context, channelID, cozeBotId, message string) (*discord
 
 	//var sentMsg *discordgo.Message
 
-	content := fmt.Sprintf("%s <@%s>", message, cozeBotId)
+	content := fmt.Sprintf("%s \n <@%s>", message, cozeBotId)
 
 	if runeCount := len([]rune(content)); runeCount > 50000 {
 		common.LogError(ctx, fmt.Sprintf("prompt已超过限制,请分段发送 [%v] %s", runeCount, content))
 		return nil, fmt.Errorf("prompt已超过限制,请分段发送 [%v]", runeCount)
 	}
 
-	// 特殊处理
-	content = strings.ReplaceAll(content, "\\n", " \\n ")
+	if len(UserAuthorizations) == 0 {
+		ChannelDel(channelID)
+		common.LogError(c.Request.Context(), fmt.Sprintf("无可用的 user_auth"))
+		return nil, fmt.Errorf("no_available_user_auth")
+	}
 
-	for i, sendContent := range common.ReverseSegment(content, 2000) {
-		//sentMsg, err := Session.ChannelMessageSend(channelID, msg)
+	userAuth, err := common.RandomElement(UserAuthorizations)
+	if err != nil {
+		return nil, err
+	}
 
+	for i, sendContent := range common.ReverseSegment(content, 1888) {
+		//sentMsg, err := Session.ChannelMessageSend(channelID, sendContent)
+		//sentMsgId := sentMsg.ID
 		// 4.0.0 版本下 用户端发送消息
-		sentMsgId, err := SendMsgByAuthorization(sendContent, channelID)
+		sendContent = strings.ReplaceAll(sendContent, "\\n", "\n")
+		sentMsgId, err := SendMsgByAuthorization(c, userAuth, sendContent, channelID)
 		if err != nil {
+			var myErr *common.DiscordUnauthorizedError
+			if errors.As(err, &myErr) {
+				// 无效则将此 auth 移除
+				UserAuthorizations = common.FilterSlice(UserAuthorizations, userAuth)
+				return SendMessage(c, channelID, cozeBotId, message)
+			}
 			common.LogError(ctx, fmt.Sprintf("error sending message: %s", err))
 			return nil, fmt.Errorf("error sending message")
 		}
-		if i == len(common.ReverseSegment(content, 2000))-1 {
+
+		time.Sleep(1 * time.Second)
+
+		if i == len(common.ReverseSegment(content, 1888))-1 {
 			return &discordgo.Message{
 				ID: sentMsgId,
 			}, nil
@@ -477,7 +503,7 @@ func scheduleDailyMessage() {
 			var sendChannelId string
 			if config.ChannelId == "" {
 				nextID, _ := common.NextID()
-				sendChannelId, _ = ChannelCreate(GuildId, fmt.Sprintf("对话%s", nextID), 0)
+				sendChannelId, _ = ChannelCreate(GuildId, fmt.Sprintf("cdp-对话%s", nextID), 0)
 				sendChannelList = append(sendChannelList, sendChannelId)
 			} else {
 				sendChannelId = config.ChannelId

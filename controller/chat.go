@@ -149,7 +149,7 @@ func ChatForOpenAI(c *gin.Context) {
 		return
 	}
 
-	sendChannelId, calledCozeBotId, err := getSendChannelIdAndCozeBotId(c, request.Model, true)
+	sendChannelId, calledCozeBotId, err := getSendChannelIdAndCozeBotId(c, request.ChannelId, request.Model, true)
 
 	content := "Hi！"
 	messages := request.Messages
@@ -159,16 +159,19 @@ func ChatForOpenAI(c *gin.Context) {
 		if message.Role == "user" {
 			switch contentObj := message.Content.(type) {
 			case string:
-				jsonData, err := json.Marshal(messages)
-				if err != nil {
-					c.JSON(http.StatusOK, gin.H{
-						"success": false,
-						"message": err.Error(),
-					})
-					return
+				if common.AllDialogRecordEnable == "1" {
+					content = contentObj
+				} else {
+					jsonData, err := json.Marshal(messages)
+					if err != nil {
+						c.JSON(http.StatusOK, gin.H{
+							"success": false,
+							"message": err.Error(),
+						})
+						return
+					}
+					content = string(jsonData)
 				}
-				content = string(jsonData)
-				//content = contentObj
 			case []interface{}:
 				content, err = buildOpenAIGPT4VForImageContent(sendChannelId, contentObj)
 				if err != nil {
@@ -371,7 +374,7 @@ func ImagesForOpenAI(c *gin.Context) {
 		return
 	}
 
-	sendChannelId, calledCozeBotId, err := getSendChannelIdAndCozeBotId(c, request.Model, true)
+	sendChannelId, calledCozeBotId, err := getSendChannelIdAndCozeBotId(c, request.ChannelId, request.Model, true)
 	if err != nil {
 		common.LogError(c.Request.Context(), err.Error())
 		c.JSON(http.StatusOK, model.OpenAIErrorResponse{
@@ -446,7 +449,7 @@ func ImagesForOpenAI(c *gin.Context) {
 
 }
 
-func getSendChannelIdAndCozeBotId(c *gin.Context, model string, isOpenAIAPI bool) (sendChannelId string, calledCozeBotId string, err error) {
+func getSendChannelIdAndCozeBotId(c *gin.Context, channelId *string, model string, isOpenAIAPI bool) (sendChannelId string, calledCozeBotId string, err error) {
 	secret := ""
 	if isOpenAIAPI {
 		if secret = c.Request.Header.Get("Authorization"); secret != "" {
@@ -455,14 +458,6 @@ func getSendChannelIdAndCozeBotId(c *gin.Context, model string, isOpenAIAPI bool
 	} else {
 		secret = c.Request.Header.Get("proxy-secret")
 	}
-
-	//if secret == "" {
-	//	if request.GetChannelId() == nil || *request.GetChannelId() == "" {
-	//		return discord.ChannelId, discord.CozeBotId, nil
-	//	} else {
-	//		return *request.GetChannelId(), discord.CozeBotId, nil
-	//	}
-	//}
 
 	// botConfigs不为空
 	if len(discord.BotConfigList) != 0 {
@@ -474,17 +469,36 @@ func getSendChannelIdAndCozeBotId(c *gin.Context, model string, isOpenAIAPI bool
 			if err != nil {
 				return "", "", err
 			}
-			var sendChannelId string
-			sendChannelId, _ = discord.ChannelCreate(discord.GuildId, fmt.Sprintf("对话%s", c.Request.Context().Value(common.RequestIdKey)), 0)
-			discord.SetChannelDeleteTimer(sendChannelId, 5*time.Minute)
-			return sendChannelId, botConfig.CozeBotId, nil
+
+			if channelId != nil && *channelId != "" {
+				return *channelId, botConfig.CozeBotId, nil
+			}
+
+			if discord.DefaultChannelEnable == "1" {
+				return botConfig.ChannelId, botConfig.CozeBotId, nil
+			} else {
+				var sendChannelId string
+				sendChannelId, _ = discord.ChannelCreate(discord.GuildId, fmt.Sprintf("cdp-对话%s", c.Request.Context().Value(common.RequestIdKey)), 0)
+				discord.SetChannelDeleteTimer(sendChannelId, 5*time.Minute)
+				return sendChannelId, botConfig.CozeBotId, nil
+			}
+
 		}
 		// 没有值抛出异常
 		return "", "", fmt.Errorf("secret匹配不到有效bot")
 	} else {
-		channelCreateId, _ := discord.ChannelCreate(discord.GuildId, fmt.Sprintf("对话%s", c.Request.Context().Value(common.RequestIdKey)), 0)
-		discord.SetChannelDeleteTimer(channelCreateId, 5*time.Minute)
-		return channelCreateId, discord.CozeBotId, nil
+
+		if channelId != nil && *channelId != "" {
+			return *channelId, discord.CozeBotId, nil
+		}
+
+		if discord.DefaultChannelEnable == "1" {
+			return discord.ChannelId, discord.CozeBotId, nil
+		} else {
+			channelCreateId, _ := discord.ChannelCreate(discord.GuildId, fmt.Sprintf("cdp-对话%s", c.Request.Context().Value(common.RequestIdKey)), 0)
+			discord.SetChannelDeleteTimer(channelCreateId, 5*time.Minute)
+			return channelCreateId, discord.CozeBotId, nil
+		}
 	}
 }
 

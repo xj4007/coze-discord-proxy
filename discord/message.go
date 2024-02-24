@@ -5,31 +5,35 @@ import (
 	"coze-discord-proxy/common"
 	"encoding/json"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 // 用户端发送消息 注意 此为临时解决方案 后续会优化代码
-func SendMsgByAuthorization(content, channelId string) (string, error) {
-	url := "https://discord.com/api/v9/channels/%s/messages"
+func SendMsgByAuthorization(c *gin.Context, userAuth, content, channelId string) (string, error) {
+	postUrl := "https://discord.com/api/v9/channels/%s/messages"
+	content = strings.Replace(content, `\u0026`, "&", -1)
 	// 构造请求体
 	requestBody, err := json.Marshal(map[string]interface{}{
 		"content": content,
 	})
 	if err != nil {
-		fmt.Println("Error encoding request body:", err)
+		common.LogError(c.Request.Context(), fmt.Sprintf("Error encoding request body:%s", err))
 		return "", err
 	}
 
-	req, err := http.NewRequest("POST", fmt.Sprintf(url, channelId), bytes.NewBuffer(requestBody))
+	req, err := http.NewRequest("POST", fmt.Sprintf(postUrl, channelId), bytes.NewBuffer(requestBody))
 	if err != nil {
-		fmt.Println("Error creating request:", err)
+		common.LogError(c.Request.Context(), fmt.Sprintf("Error creating request:%s", err))
 		return "", err
 	}
 
 	// 设置请求头-部分请求头不传没问题，但目前仍有被discord检测异常的风险
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", UserAuthorization)
+	req.Header.Set("Authorization", userAuth)
 	req.Header.Set("Origin", "https://discord.com")
 	req.Header.Set("Referer", fmt.Sprintf("https://discord.com/channels/%s/%s", GuildId, channelId))
 	if UserAgent != "" {
@@ -40,9 +44,19 @@ func SendMsgByAuthorization(content, channelId string) (string, error) {
 
 	// 发起请求
 	client := &http.Client{}
+	if ProxyUrl != "" {
+		proxyURL, _ := url.Parse(ProxyUrl)
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
+		client = &http.Client{
+			Transport: transport,
+		}
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("Error sending request:", err)
+		common.LogError(c.Request.Context(), fmt.Sprintf("Error sending request:%s", err))
 		return "", err
 	}
 	defer resp.Body.Close()
@@ -67,9 +81,21 @@ func SendMsgByAuthorization(content, channelId string) (string, error) {
 
 	// 类型断言来获取id的值
 	id, ok := result["id"].(string)
+
 	if !ok {
-		common.SysError("ID is not a string")
+		// 401
+		if errMessage, ok := result["message"].(string); ok {
+			if errMessage == "401: Unauthorized" {
+				common.LogWarn(c.Request.Context(), fmt.Sprintf("USER_AUTHORIZATION:%s 已失效", userAuth))
+				return "", &common.DiscordUnauthorizedError{
+					ErrCode: 401,
+					Message: "discord 鉴权未通过",
+				}
+			}
+		}
+		common.LogError(c.Request.Context(), fmt.Sprintf("result:%s", bodyString))
 		return "", fmt.Errorf("ID is not a string")
+	} else {
+		return id, nil
 	}
-	return id, nil
 }
